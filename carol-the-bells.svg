@@ -1,0 +1,365 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- carol-the-bells.svg — procedural choir choreography, Stage 1 implemented -->
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900" xmlns:xlink="http://www.w3.org/1999/xlink">
+  <defs>
+    <style><![CDATA[
+      text { font-family: Arial, Helvetica, sans-serif; fill: #eee }
+      .frame { fill: none; stroke: #ddd; stroke-width: 6 }
+      .label { font-size: 20px; text-anchor: middle }
+      .role-label { font-size: 14px; text-anchor: middle; fill: #fff; opacity: 0.9 }
+    ]]></style>
+  </defs>
+
+  <!-- Background and frame -->
+  <rect x="0" y="0" width="1600" height="900" fill="#111" />
+  <rect x="20" y="20" width="1560" height="860" class="frame" rx="8" ry="8" />
+
+  <!-- Top center label: front of stage is top -->
+  <text x="800" y="50" class="label">К зрителю (передний край сцены)</text>
+
+  <!-- Main group for singers -->
+  <g id="stage" transform="translate(0,0)"></g>
+
+  <!-- Soloist label (below soloist, created from script) -->
+
+  <script><![CDATA[
+(function(){
+  // Scene constants
+  const svgNS = 'http://www.w3.org/2000/svg';
+  const W = 80; // width of ellipse (2*rx)
+  const H = 40; // height of ellipse (2*ry)
+  const rx = W/2, ry = H/2;
+
+  const vbox = {w:1600,h:900};
+  const stageG = document.getElementById('stage');
+
+  // Columns positions (left and right near edges)
+  const marginX = 120;
+  const leftColX = marginX + rx + (W*0.3);
+  const rightColX = vbox.w - marginX - rx - (W*0.3);
+
+  // Vertical placement: 9 rows per column
+  const rows = 9;
+  // Vertical step between centers per spec: H + (2/3)*W
+  const vyStep = H + (2/3)*W;
+  const totalRowsHeight = vyStep * (rows-1);
+  const topRowY = (vbox.h - totalRowsHeight)/2;
+
+  // Horizontal step between two people in the same row (pair within a column)
+  const hxStepBetween = W + (2/3)*W;
+
+  // Colors per role
+  const COLORS = {
+    soprano: '#FFD54A', // yellow
+    alto: '#FF8A50', // orange
+    tenor: '#6FCF97', // green
+    baritone: '#4D77FF', // blue
+    soloist: '#FF4D4D' // red
+  };
+
+  // Movement config for mobile singers
+  const movementStart = 1000; // ms before movement begins
+  const stageDur = 20000; // Stage 1 duration approx (ms)
+
+  // We'll compute column extents based on pair layout to define inner free area
+  const pairHalfOffset = hxStepBetween/2;
+  const leftColumnRightEdge = leftColX + pairHalfOffset + rx;
+  const rightColumnLeftEdge = rightColX - pairHalfOffset - rx;
+  const innerLeftLimit = leftColumnRightEdge + 10; // free area starts after left column (smaller margin)
+  const innerRightLimit = rightColumnLeftEdge - 10; // free area ends before right column
+  const innerTopLimit = 60 + ry + 20;
+  const innerBottomLimit = vbox.h - 140 - ry;
+  // Stage absolute bounds (don't clamp into inner area directly, to avoid teleport)
+  const stageLeftLimit = 20 + rx;
+  const stageRightLimit = vbox.w - 20 - rx;
+
+  // Global lists
+  const singers = [];
+  const mobileSingers = [];
+  const staticSingers = [];
+
+  // Helper: create an SVG element
+  function el(tag, attrs){
+    const e = document.createElementNS(svgNS, tag);
+    for(const k in (attrs||{})) e.setAttribute(k, attrs[k]);
+    return e;
+  }
+
+  // Singer factory
+  function createSinger(id, role, movable, cx, cy, opts){
+    opts = opts || {};
+    const g = el('g', {class:'singer', transform:`translate(${cx},${cy}) rotate(0)`});
+
+    const scale = (role==='soloist') ? 1.15 : 1;
+    const rxx = rx*scale, ryy = ry*scale;
+    const color = COLORS[role] || '#999';
+
+    // Body
+    const ell = el('ellipse', {cx:0, cy:0, rx:rxx, ry:ryy, fill:color, stroke:'#111', 'stroke-width':1});
+    g.appendChild(ell);
+
+  // Arrow pointing _up_ initially (toward viewer). White color per request.
+  // Make it short, only slightly outside the oval
+  const arrowLen = Math.max(8, ryy + 6); // short arrow just beyond the oval
+  const arrow = el('g', {class:'arrow'});
+  const line = el('line', {x1:0, y1:0, x2:0, y2:-arrowLen, stroke:'#fff', 'stroke-width':3, 'stroke-linecap':'round'});
+  const head = el('polygon', {points:`0,${-arrowLen} -5,${-arrowLen+8} 5,${-arrowLen+8}`, fill:'#fff'});
+    arrow.appendChild(line); arrow.appendChild(head);
+    g.appendChild(arrow);
+
+    const outline = el('ellipse', {cx:0, cy:0, rx:rxx+1, ry:ryy+1, fill:'none', stroke:'#000', 'stroke-width':2, opacity:0.12});
+    g.appendChild(outline);
+
+    stageG.appendChild(g);
+
+    const state = {
+      id, role, movable, cx, cy, angle:0, target: null,
+      // faster walking speed for moving singers
+      speed: (movable? (54 + Math.random()*30) : 0), // px/s
+      dom: {g, ell, arrow}, rxx, ryy, scale,
+      timeToNextTarget: 2000 + Math.random()*2000,
+      vx: 0, vy: 0, collisionCount: 0 // current velocity for smooth steering
+    };
+
+    singers.push(state);
+    if(movable) mobileSingers.push(state); else staticSingers.push(state);
+    return state;
+  }
+
+  // Place columns: each column has 9 rows and 2 singers per row (left/right inside column)
+  let idCounter = 1;
+  for(let row=0; row<rows; row++){
+    const cy = topRowY + row*vyStep;
+    const leftRole = (row < 5) ? 'alto' : 'baritone';
+    const rightRole = (row < 5) ? 'soprano' : 'tenor';
+
+    // left column: two singers per row (pair centered around leftColX)
+    const lx1 = leftColX - pairHalfOffset;
+    const lx2 = leftColX + pairHalfOffset;
+    createSinger(idCounter++, leftRole, (leftRole==='alto'), lx1, cy);
+    createSinger(idCounter++, leftRole, (leftRole==='alto'), lx2, cy);
+
+    // right column pair
+    const rx1 = rightColX - pairHalfOffset;
+    const rx2 = rightColX + pairHalfOffset;
+    createSinger(idCounter++, rightRole, (rightRole==='soprano'), rx1, cy);
+    createSinger(idCounter++, rightRole, (rightRole==='soprano'), rx2, cy);
+  }
+
+  // Soloist: place at exact center of the scene
+  const soloX = vbox.w/2;
+  const soloY = vbox.h/2;
+  const solo = createSinger(idCounter++, 'soloist', false, soloX, soloY, {});
+  const soloLabel = el('text', {x: soloX, y: soloY + 60, 'class':'role-label'});
+  soloLabel.textContent = 'Солист';
+  stageG.appendChild(soloLabel);
+
+  // Apply initial transform (must be pixel-identical to initial layout)
+  function applyTransform(s){ s.dom.g.setAttribute('transform', `translate(${s.cx},${s.cy}) rotate(${s.angle})`); }
+  singers.forEach(s=>applyTransform(s));
+
+  // Helpers
+  function dist(a,b){ const dx = a.cx - b.cx, dy = a.cy - b.cy; return Math.sqrt(dx*dx+dy*dy); }
+
+  // Pick target avoiding static singers and other mobile positions (to spread out)
+  function pickRandomTarget(s){
+    for(let attempts=0; attempts<80; attempts++){
+      const tx = innerLeftLimit + Math.random()*(innerRightLimit - innerLeftLimit);
+      const ty = innerTopLimit + Math.random()*(innerBottomLimit - innerTopLimit);
+      const fake = {cx:tx, cy:ty, rxx: s.rxx};
+      let ok=true;
+      for(const st of staticSingers){ if(dist(st,fake) < (st.rxx + s.rxx + 12)) { ok=false; break; } }
+      if(!ok) continue;
+      // prefer positions not too close to other mobile current centers
+      let tooClose=false;
+      for(const m of mobileSingers){ if(m!==s && dist(m,fake) < (m.rxx + s.rxx + 20)) { tooClose=true; break; } }
+      if(tooClose) continue;
+      return {x:tx,y:ty};
+    }
+    // fallback near current
+    return {x: Math.max(innerLeftLimit, Math.min(innerRightLimit, s.cx + (Math.random()-0.5)*150)),
+            y: Math.max(innerTopLimit, Math.min(innerBottomLimit, s.cy + (Math.random()-0.5)*150)) };
+  }
+
+  // Compute separation (repulsion) vector from others
+  function computeSeparation(s){
+    let rx=0, ry=0;
+    const neigh = 48 + Math.max(s.rxx, s.ryy||s.ry); // influence radius
+    for(const other of singers){
+      if(other===s) continue;
+      const d = dist(s,other);
+      if(d < neigh && d>0){
+        const dx = s.cx - other.cx, dy = s.cy - other.cy;
+        const inv = (neigh - d)/neigh;
+        rx += (dx/d)*inv; ry += (dy/d)*inv;
+      }
+    }
+    return {x:rx, y:ry};
+  }
+
+  // Obstacle avoidance: add a dodge perpendicular when very close to a static singer
+  function computeObstacleDodge(s){
+    let dx=0, dy=0;
+    for(const st of staticSingers){ const d = dist(s,st); const minD = st.rxx + s.rxx + 8; if(d < minD && d>0){
+        // perpendicular vector to (st->s)
+        const vx = s.cx - st.cx, vy = s.cy - st.cy; const nx = vx/d, ny = vy/d;
+        // perpendicular
+        dx += -ny * (minD - d) * 0.6;
+        dy += nx * (minD - d) * 0.6;
+    }}
+    return {x:dx,y:dy};
+  }
+
+  // Smooth angle difference
+  function angleDiff(a,b){ let d = (b - a + 180) % 360 - 180; return d < -180 ? d+360 : d; }
+
+  // Initialize mobile targets
+  mobileSingers.forEach(s=>{ s.target = pickRandomTarget(s); s.vx = 0; s.vy = 0; s.collisionCount = 0; });
+
+  // Movement loop
+  let startTime = null; let movementActive = false; let lastTs = null; let stopRequested=false;
+  let justActivated = false;
+  function step(ts){
+    if(!startTime) startTime = ts;
+    const elapsed = ts - startTime;
+
+    // Activate movement at correct time, but avoid a big dt jump by resetting lastTs when activation happens
+    if(!movementActive && elapsed >= movementStart){ movementActive = true; justActivated = true; lastTs = ts; }
+    const dt = lastTs ? (ts - lastTs)/1000 : 0; // seconds
+
+    for(const s of mobileSingers){
+      if(!movementActive){ applyTransform(s); continue; }
+
+      // decrement timer and possibly pick new target
+      s.timeToNextTarget -= dt*1000;
+      const toTarget = {x: s.target.x - s.cx, y: s.target.y - s.cy};
+      const distToTarget = Math.sqrt(toTarget.x*toTarget.x + toTarget.y*toTarget.y);
+      if(distToTarget < 10 || s.timeToNextTarget <= 0){ s.target = pickRandomTarget(s); s.timeToNextTarget = 1800 + Math.random()*4000; }
+
+      // Desired velocity (seek) — target direction normalized * speed
+      let desiredVX = 0, desiredVY = 0;
+      if(distToTarget > 1){ desiredVX = (toTarget.x/distToTarget) * s.speed; desiredVY = (toTarget.y/distToTarget) * s.speed; }
+
+  // Separation and dodge adjustments (softer to avoid oscillations)
+  const sep = computeSeparation(s);
+  const dodge = computeObstacleDodge(s);
+  const avoidWeightX = sep.x * 28 + dodge.x; // softer separation
+  const avoidWeightY = sep.y * 28 + dodge.y;
+  const combinedVX = desiredVX + avoidWeightX;
+  const combinedVY = desiredVY + avoidWeightY;
+
+  // steering factor (higher = faster alignment, but keep moderate for smooth turns)
+  const steeringAlpha = 0.14; // responsive yet smooth
+  s.vx += (combinedVX - s.vx) * steeringAlpha;
+  s.vy += (combinedVY - s.vy) * steeringAlpha;
+
+      // Predict next position and check for potential collisions; if collision predicted, negotiate who yields
+      const nextX = s.cx + s.vx * dt;
+      const nextY = s.cy + s.vy * dt;
+      let collided = false;
+      let collisionCorrection = {x:0,y:0};
+      for(const other of singers){ if(other===s) continue;
+        const minD = other.rxx + s.rxx + 2;
+        const ddx = nextX - other.cx, ddy = nextY - other.cy; const dd = Math.sqrt(ddx*ddx + ddy*ddy);
+        if(dd < minD){
+          collided = true;
+          // negotiate: the singer farther from its current target yields (will sidestep)
+          const otherDistToTarget = other.target ? Math.hypot(other.target.x - other.cx, other.target.y - other.cy) : 0;
+          const myDistToTarget = s.target ? Math.hypot(s.target.x - s.cx, s.target.y - s.cy) : 0;
+          if(myDistToTarget > otherDistToTarget){
+            // s yields: create a lateral temporary target away from other
+            const nx = (dd>0) ? (ddx/dd) : (Math.random()-0.5);
+            const ny = (dd>0) ? (ddy/dd) : (Math.random()-0.5);
+            const px = -ny, py = nx; // perpendicular
+            s.target = { x: s.cx + px * (minD + 30), y: s.cy + py * (minD + 30) };
+            collisionCorrection.x += px * (minD - dd) * 0.6;
+            collisionCorrection.y += py * (minD - dd) * 0.6;
+          } else {
+            // other yields: nudge away
+            const nx = (dd>0) ? (ddx/dd) : (Math.random()-0.5);
+            const ny = (dd>0) ? (ddy/dd) : (Math.random()-0.5);
+            const px = -ny, py = nx;
+            collisionCorrection.x += px * (minD - dd) * 0.4;
+            collisionCorrection.y += py * (minD - dd) * 0.4;
+          }
+        }
+      }
+
+      if(collided){
+        // apply small correction and retarget to break potential oscillation
+        s.vx += collisionCorrection.x * 2;
+        s.vy += collisionCorrection.y * 2;
+        s.collisionCount = (s.collisionCount || 0) + 1;
+        if(s.collisionCount > 3){ s.target = pickRandomTarget(s); s.collisionCount = 0; }
+      } else {
+        s.collisionCount = 0;
+      }
+
+  // Damping to avoid perpetual circulation
+  const damping = Math.max(0, 1 - 2.0*dt);
+  s.vx *= damping; s.vy *= damping;
+
+    // Limit speed
+    let spd = Math.sqrt(s.vx*s.vx + s.vy*s.vy);
+    const maxSpeed = s.speed * 1.4;
+    if(spd > maxSpeed){ s.vx = s.vx/spd*maxSpeed; s.vy = s.vy/spd*maxSpeed; spd = maxSpeed; }
+
+    // Integrate (clamp to stage bounds only to avoid instant jumps into inner area)
+    s.cx += s.vx * dt; s.cy += s.vy * dt;
+    s.cx = Math.max(stageLeftLimit, Math.min(stageRightLimit, s.cx));
+    s.cy = Math.max(innerTopLimit, Math.min(innerBottomLimit, s.cy));
+
+      // Compute angle from velocity; arrow is drawn up so add 90 degrees
+      if(spd > 0.3){
+        let desired = Math.atan2(s.vy, s.vx) * 180 / Math.PI + 90;
+        const maxTurn = 90 * dt; // smaller max turn for smooth small-degree rotations
+        const delta = angleDiff(s.angle, desired);
+        const capped = Math.max(-maxTurn, Math.min(maxTurn, delta));
+        s.angle = s.angle + capped;
+      }
+
+      applyTransform(s);
+    }
+
+    // Post-pass: hard separation to resolve any remaining overlaps (split overlap evenly)
+    for(let i=0;i<singers.length;i++){
+      for(let j=i+1;j<singers.length;j++){
+        const a = singers[i], b = singers[j];
+        const md = a.rxx + b.rxx + 2;
+        const dx = a.cx - b.cx, dy = a.cy - b.cy; const d = Math.sqrt(dx*dx + dy*dy)||0.001;
+        if(d < md){
+          const overlap = (md - d);
+          const nx = dx/d, ny = dy/d;
+          const adjustX = nx * overlap * 0.5;
+          const adjustY = ny * overlap * 0.5;
+          // move mobiles preferentially; if both static, move none
+          if(a.movable) { a.cx += adjustX; a.cy += adjustY; }
+          if(b.movable) { b.cx -= adjustX; b.cy -= adjustY; }
+          // ensure within stage
+          a.cx = Math.max(stageLeftLimit, Math.min(stageRightLimit, a.cx)); a.cy = Math.max(innerTopLimit, Math.min(innerBottomLimit, a.cy));
+          b.cx = Math.max(stageLeftLimit, Math.min(stageRightLimit, b.cx)); b.cy = Math.max(innerTopLimit, Math.min(innerBottomLimit, b.cy));
+          applyTransform(a); applyTransform(b);
+        }
+      }
+    }
+
+    // avoid initial teleport: after activation skip applying movement until next frame
+    if(justActivated){ justActivated = false; }
+
+    lastTs = ts;
+    if(!stopRequested) requestAnimationFrame(step);
+  }
+  requestAnimationFrame(step);
+
+  // Expose choreography controller
+  window.CHO = window.CHO || {};
+  window.CHO.singers = singers; window.CHO.mobile = mobileSingers; window.CHO.static = staticSingers;
+  window.CHO.pickRandomTarget = pickRandomTarget;
+  window.CHO.setStage = function(stageNum){};
+
+  // Titles for accessibility
+  singers.forEach(s=>{ const t = el('title'); t.textContent = `${s.role} ${s.id}`; s.dom.g.appendChild(t); });
+
+})();
+]]></script>
+</svg>
