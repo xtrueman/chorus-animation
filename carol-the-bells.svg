@@ -14,8 +14,11 @@
   <rect x="0" y="0" width="1600" height="900" fill="#111" />
   <rect x="20" y="20" width="1560" height="860" class="frame" rx="8" ry="8" />
 
+  <!-- Timer (top-left) -->
+  <text id="timer" x="40" y="50" class="label" text-anchor="start">0s</text>
+
   <!-- Top center label: front of stage is top -->
-  <text x="800" y="50" class="label">К зрителю (передний край сцены)</text>
+  <text id="stage-label" x="800" y="50" class="label">К зрителю (передний край сцены)</text>
 
   <!-- Main group for singers -->
   <g id="stage" transform="translate(0,0)"></g>
@@ -32,6 +35,8 @@
 
   const vbox = {w:1600,h:900};
   const stageG = document.getElementById('stage');
+  const stageLabelEl = document.getElementById('stage-label');
+  const timerEl = document.getElementById('timer');
 
   // Columns positions (left and right near edges)
   const marginX = 120;
@@ -59,7 +64,29 @@
 
   // Movement config for mobile singers
   const movementStart = 1000; // ms before movement begins
-  const stageDur = 20000; // Stage 1 duration approx (ms)
+  const convergeDuration = 3000; // first 3s after movement start pull toward center
+  const STAGE_LABELS = {
+    idle: 'К зрителю (передний край сцены)',
+    stage1: 'Stage 1 — Свободное блуждание',
+    stage2: 'Stage 2 — Формирование пар и парная ходьба',
+    stage3: 'Stage 3 — Остановка и разворот к зрителю',
+    stage4: 'Stage 4 — Возврат в колонны',
+    stage5: 'Stage 5 — Формирование буквы X'
+  };
+
+  // Timeline for pairing/returning (relative to startTime)
+  // selection at 15s, split at 20s, pair-walk 15s (20-35), face audience 10s (35-45), return 5s (45-50)
+  const PAIR_SELECT_AT = movementStart + 15000;
+  const PAIR_SPLIT_AT = movementStart + 20000;
+  const PAIR_WALK_END = PAIR_SPLIT_AT + 15000; // 35s
+  const PAIR_FACE_END = PAIR_WALK_END + 10000; // 45s
+  const RETURN_DURATION = 10000; // 10s for Stage 4
+  const RETURN_END = PAIR_FACE_END + RETURN_DURATION; // 55s
+  const STAGE5_START = RETURN_END; // 55s
+  const STAGE5_END = STAGE5_START + 16000; // 16s duration
+
+  // Speed multiplier for walking actors (user requested 1.5x)
+  const WALK_SPEED_MULT = 1.5;
 
   // We'll compute column extents based on pair layout to define inner free area
   const pairHalfOffset = hxStepBetween/2;
@@ -77,6 +104,13 @@
   const singers = [];
   const mobileSingers = [];
   const staticSingers = [];
+
+  // Pairing state
+  let pairs = []; // array of {a: singer, b: singer, mode: 'side'|'face', centerTarget: {x,y}, phase: 0, line: SVGLine, facingAngle: number}
+  let pairSelected = false, pairSplit = false, pairWalking = false, pairFaced = false, returnStarted = false, stage5Started = false;
+  let returnSlotsLeft = [], returnSlotsRight = [];
+  let returnStartMs = null, stage5StartMs = null;
+  let stage5SpeedPhase1 = 0, stage5SpeedPhase2 = 0;
 
   // Helper: create an SVG element
   function el(tag, attrs){
@@ -112,13 +146,22 @@
 
     stageG.appendChild(g);
 
+    const baseSpeed = (movable? (54 + Math.random()*30) : 0); // px/s
     const state = {
       id, role, movable, cx, cy, angle:0, target: null,
-      // faster walking speed for moving singers
-      speed: (movable? (54 + Math.random()*30) : 0), // px/s
+      // apply requested speed multiplier for movers
+      speed: movable ? (baseSpeed * WALK_SPEED_MULT) : 0,
       dom: {g, ell, arrow}, rxx, ryy, scale,
       timeToNextTarget: 2000 + Math.random()*2000,
-      vx: 0, vy: 0, collisionCount: 0 // current velocity for smooth steering
+      vx: 0, vy: 0, collisionCount: 0, // current velocity for smooth steering
+      // record home position to return to formation later
+      homeX: cx, homeY: cy,
+      partnerId: null,
+      isReturning: false,
+      hasFinishedReturn: false,
+      stage5Target: null,
+      stage5Phase1Target: null,
+      returnSlotId: null
     };
 
     singers.push(state);
@@ -160,6 +203,7 @@
 
   // Helpers
   function dist(a,b){ const dx = a.cx - b.cx, dy = a.cy - b.cy; return Math.sqrt(dx*dx+dy*dy); }
+  function distXY(aX,aY,b){ const dx = aX - b.cx, dy = aY - b.cy; return Math.sqrt(dx*dx+dy*dy); }
 
   // Pick target avoiding static singers and other mobile positions (to spread out)
   function pickRandomTarget(s){
@@ -179,6 +223,254 @@
     // fallback near current
     return {x: Math.max(innerLeftLimit, Math.min(innerRightLimit, s.cx + (Math.random()-0.5)*150)),
             y: Math.max(innerTopLimit, Math.min(innerBottomLimit, s.cy + (Math.random()-0.5)*150)) };
+  }
+
+  // Pair center targets prefer to occupy wider space (farther from global center)
+  function pickWideCenterTarget(refSinger){
+    const cx = vbox.w/2, cy = vbox.h/2;
+    let best = pickRandomTarget(refSinger), bestScore = -1;
+    for(let i=0;i<16;i++){
+      const t = pickRandomTarget(refSinger);
+      const score = Math.hypot(t.x - cx, t.y - cy) + Math.random()*40; // bias outward, add jitter to avoid ties
+      if(score > bestScore){ bestScore = score; best = t; }
+    }
+    return best;
+  }
+
+  // Initial converge target: pull toward center area
+  function pickCenterPullTarget(s){
+    const center = {x: vbox.w/2, y: vbox.h/2};
+    let best = null, bestScore = -1;
+    for(let i=0;i<16;i++){
+      const t = pickRandomTarget(s);
+      const score = -Math.hypot(t.x - center.x, t.y - center.y);
+      if(score > bestScore){ bestScore = score; best = t; }
+    }
+    return best || center;
+  }
+
+  // Pairing utilities
+  function pointSegmentDistance(ax, ay, bx, by, px, py){
+    const dx = bx - ax, dy = by - ay;
+    const len2 = dx*dx + dy*dy;
+    if(len2 === 0) return Math.hypot(px - ax, py - ay);
+    let t = ((px - ax) * dx + (py - ay) * dy) / len2;
+    t = Math.max(0, Math.min(1, t));
+    const projX = ax + t * dx, projY = ay + t * dy;
+    return Math.hypot(px - projX, py - projY);
+  }
+
+  // Cost function prefers nearby partners with a clear corridor (penalizes statics and dense crowds)
+  function pairCost(a,b){
+    const baseD = dist(a,b);
+    let cost = baseD;
+    const corridorPad = 14;
+    for(const st of staticSingers){
+      const clearance = pointSegmentDistance(a.cx, a.cy, b.cx, b.cy, st.cx, st.cy) - (st.rxx + corridorPad);
+      if(clearance < 0) cost += (-clearance) * 420; // heavy penalty if corridor crosses statics
+    }
+    for(const m of mobileSingers){ if(m===a || m===b) continue;
+      const clearance = pointSegmentDistance(a.cx, a.cy, b.cx, b.cy, m.cx, m.cy) - (m.rxx + 10);
+      if(clearance < 0) cost += (-clearance) * 80; // softer penalty for crowded corridors
+    }
+    if(baseD > 280) cost += (baseD - 280) * 0.9; // discourage very long pairings
+    return cost;
+  }
+
+  function computeNearestUnpairedList(){
+    const list = mobileSingers.slice();
+    const result = new Map();
+    for(const s of list){
+      let nearest = null, bestCost = 1e9;
+      for(const o of list){ if(o===s) continue; const c = pairCost(s,o); if(c < bestCost){ bestCost = c; nearest = o; } }
+      if(nearest) result.set(s, {other: nearest, cost: bestCost});
+    }
+    return result;
+  }
+
+  function formPairsGreedy(){
+    const unpaired = new Set(mobileSingers);
+    const newPairs = [];
+    const options = [];
+    const arr = Array.from(unpaired);
+    for(let i=0;i<arr.length;i++){
+      for(let j=i+1;j<arr.length;j++){
+        const a = arr[i], b = arr[j];
+        options.push({a,b,cost: pairCost(a,b)});
+      }
+    }
+    options.sort((x,y)=>x.cost - y.cost);
+    for(const opt of options){ if(!unpaired.has(opt.a) || !unpaired.has(opt.b)) continue;
+      const s = opt.a, best = opt.b;
+      unpaired.delete(s); unpaired.delete(best);
+      s.partnerId = best.id; best.partnerId = s.id;
+      // decorative thin blue line between pair centers
+      const ln = el('line', {x1: s.cx, y1: s.cy, x2: best.cx, y2: best.cy, stroke: '#6ec8ff', 'stroke-width': 2, 'stroke-linecap': 'round', opacity: 0.95});
+      pairLineGroup.appendChild(ln);
+      newPairs.push({a:s, b:best, mode: (Math.random() < 0.5 ? 'side' : 'face'), centerTarget: {x:(s.cx+best.cx)/2, y:(s.cy+best.cy)/2}, phase: 0, centerNextAt: 0, line: ln, facingAngle: 0, modeSwitchAt: 0});
+    }
+    pairs = newPairs;
+  }
+
+  // --- Stage utilities ---
+  function getPairForSinger(s){ return pairs.find(pp => pp.a===s || pp.b===s) || null; }
+
+  function startPairSelection(){
+    const nearestMap = computeNearestUnpairedList();
+    for(const [s,info] of nearestMap.entries()){ s.suggestedPartnerId = info.other.id; }
+    pairSelected = true;
+  }
+
+  function startPairSplit(){
+    formPairsGreedy();
+    pairSplit = true; pairWalking = true;
+    pairs.forEach(p=>{ p.centerTarget = pickWideCenterTarget(p.a); p.centerNextAt = 0; p.phase = 0; });
+  }
+
+  function startPairFacing(){
+    pairWalking = false; pairFaced = true;
+    pairs.forEach(p=>{ p.facingAngle = (Math.random()*40 - 20); });
+  }
+
+  function orderSlotsOuterFirst(slots, side){
+    if(side === 'left'){
+      return slots.slice().sort((a,b)=> (a.x === b.x ? Math.abs(a.y - vbox.h/2) - Math.abs(b.y - vbox.h/2) : a.x - b.x));
+    }
+    return slots.slice().sort((a,b)=> (a.x === b.x ? Math.abs(a.y - vbox.h/2) - Math.abs(b.y - vbox.h/2) : b.x - a.x));
+  }
+
+  function initReturnSlots(){
+    returnSlotsLeft = [];
+    returnSlotsRight = [];
+    let sid = 0;
+    singers.forEach(x=>{
+      if(x.role==='alto' || x.role==='soprano'){
+        const slot = {id: sid++, x:x.homeX, y:x.homeY};
+        if(x.role==='alto') returnSlotsLeft.push(slot); else returnSlotsRight.push(slot);
+      }
+    });
+    returnSlotsLeft = orderSlotsOuterFirst(returnSlotsLeft, 'left');
+    returnSlotsRight = orderSlotsOuterFirst(returnSlotsRight, 'right');
+  }
+
+  function chooseReturnSlotOnce(s){
+    const slots = s.role==='alto' ? returnSlotsLeft : returnSlotsRight;
+    if(!slots || !slots.length) return null;
+    // pick closest slot in ordered list (outer first) to current position
+    let best=null, bd=1e9;
+    for(const sl of slots){
+      const d = Math.hypot(sl.x - s.cx, sl.y - s.cy);
+      if(d < bd){ bd = d; best = sl; }
+    }
+    return best;
+  }
+
+  function startReturnToFormation(){
+    returnStarted = true;
+    returnStartMs = performance.now();
+    pairFaced = false;
+    // remove pair visuals/state
+    pairs.forEach(p=>{ if(p.line && p.line.parentNode) p.line.parentNode.removeChild(p.line); });
+    pairs = [];
+
+    initReturnSlots();
+    mobileSingers.forEach(m=>{
+      const slot = chooseReturnSlotOnce(m);
+      if(slot){
+        m.target = {x: slot.x, y: slot.y};
+        m.returnSlotId = slot.id;
+      }
+      const d = m.target ? Math.hypot(m.cx - m.target.x, m.cy - m.target.y) : 0;
+      m.speed = Math.max(m.speed, (d/4)); // faster return
+      m.timeToNextTarget = 1e9;
+      m.isReturning = true;
+      m.partnerId = null;
+      m.suggestedPartnerId = null;
+      m.hasFinishedReturn = false;
+    });
+  }
+
+  function startStage5(){
+    stage5Started = true;
+    stage5StartMs = performance.now();
+    const totalRows = rows;
+    const spanX = rightColX - leftColX;
+    let maxPhase1Dist = 0;
+    let maxPhase2Dist = 0;
+    singers.forEach(s=>{
+      s.isReturning = false; s.hasFinishedReturn = false;
+      if(s.role === 'soloist'){
+        const forwardY = Math.max(40 + ry, s.homeY - vyStep * 1.5); // сильнее вперёд
+        s.stage5Phase1Target = {x: s.homeX, y: forwardY};
+        s.stage5Target = {x: s.homeX, y: forwardY};
+        s.stage5SpeedFactor = 0.8;
+        s.angle = 0;
+        s.target = {x: s.stage5Phase1Target.x, y: s.stage5Phase1Target.y};
+        const d1 = Math.hypot(s.cx - s.stage5Phase1Target.x, s.cy - s.stage5Phase1Target.y);
+        s.speed = Math.max(s.speed, d1 / 6.0);
+        s.timeToNextTarget = 1e9;
+        maxPhase1Dist = Math.max(maxPhase1Dist, d1);
+        maxPhase2Dist = Math.max(maxPhase2Dist, 0);
+        return;
+      }
+      const isLeft = (s.role === 'alto' || s.role === 'baritone');
+      const colCenter = isLeft ? leftColX : rightColX;
+      const rowIdx = Math.round((s.homeY - topRowY)/vyStep);
+      const rowNorm = Math.max(0, Math.min(1, rowIdx / (totalRows - 1)));
+      // скорость по рядам: передний 0, задний 1, середний ~0.5 (учитываем все партии)
+      s.stage5SpeedFactor = rowNorm;
+      const baseLineX = isLeft
+        ? leftColX + spanX * rowNorm
+        : rightColX - spanX * rowNorm;
+      const seatOffset = s.homeX - colCenter;
+      const finalX = baseLineX + seatOffset;
+      const shiftedY = (rowIdx === 0) ? s.homeY : (s.homeY + (isLeft ? -vyStep/4 : vyStep/4)); // шахматный разъезд (каждый на 1/4 шага)
+      s.stage5Phase1Target = {x: s.homeX, y: shiftedY};
+      s.stage5Target = {x: finalX, y: shiftedY};
+      s.target = {x: s.stage5Phase1Target.x, y: s.stage5Phase1Target.y};
+      const d1 = Math.hypot(s.cx - s.stage5Phase1Target.x, s.cy - s.stage5Phase1Target.y);
+      const d2 = Math.hypot(s.stage5Phase1Target.x - s.stage5Target.x, s.stage5Phase1Target.y - s.stage5Target.y);
+      maxPhase1Dist = Math.max(maxPhase1Dist, d1);
+      maxPhase2Dist = Math.max(maxPhase2Dist, d2);
+      s.speed = Math.max(s.speed, d1); // temp, real speed set below
+      s.timeToNextTarget = 1e9;
+      s.angle = 0;
+    });
+    stage5SpeedPhase1 = maxPhase1Dist / 1.0;
+    stage5SpeedPhase2 = maxPhase2Dist / 15.0;
+    if(!isFinite(stage5SpeedPhase1)) stage5SpeedPhase1 = 0;
+    if(!isFinite(stage5SpeedPhase2)) stage5SpeedPhase2 = 0;
+  }
+
+  function applyStage5Motion(s, dt, elapsed){
+    if(!s.stage5Target || !s.stage5Phase1Target) return;
+    const phaseEnd1 = (STAGE5_START + 1000);
+    const phase1 = elapsed < phaseEnd1;
+    const tgt = phase1 ? s.stage5Phase1Target : s.stage5Target;
+    if(elapsed >= STAGE5_END){
+      s.cx = tgt.x; s.cy = tgt.y; s.vx = 0; s.vy = 0; s.angle = 0;
+      applyTransform(s);
+      return;
+    }
+    const dx = tgt.x - s.cx, dy = tgt.y - s.cy;
+    const dist = Math.hypot(dx, dy);
+    const phaseEnd = phase1 ? phaseEnd1 : STAGE5_END;
+    const remainMs = Math.max(200, phaseEnd - elapsed);
+    const remainSec = remainMs/1000;
+    const baseSpeed = phase1 ? stage5SpeedPhase1 : stage5SpeedPhase2;
+    const desiredSpeed = baseSpeed;
+    const reqSpeed = dist / remainSec;
+    const finalSpeed = Math.max(reqSpeed, desiredSpeed);
+    if(finalSpeed > s.speed) s.speed = finalSpeed;
+    const desiredVX = dist > 0.1 ? (dx/dist) * s.speed : 0;
+    const desiredVY = dist > 0.1 ? (dy/dist) * s.speed : 0;
+    const alpha = 0.2;
+    s.vx += (desiredVX - s.vx) * alpha;
+    s.vy += (desiredVY - s.vy) * alpha;
+    s.cx += s.vx * dt;
+    s.cy += s.vy * dt;
+    s.angle = 0; // face forward
+    applyTransform(s);
   }
 
   // Compute separation (repulsion) vector from others
@@ -212,9 +504,20 @@
 
   // Smooth angle difference
   function angleDiff(a,b){ let d = (b - a + 180) % 360 - 180; return d < -180 ? d+360 : d; }
+  function setStageLabel(key){ if(stageLabelEl) stageLabelEl.textContent = STAGE_LABELS[key] || STAGE_LABELS.idle; }
+  let lastTimerSec = -1;
+  function updateTimer(elapsedMs){
+    if(!timerEl) return;
+    const sec = Math.floor(elapsedMs/1000);
+    if(sec !== lastTimerSec){ timerEl.textContent = `${sec}s`; lastTimerSec = sec; }
+  }
 
   // Initialize mobile targets
   mobileSingers.forEach(s=>{ s.target = pickRandomTarget(s); s.vx = 0; s.vy = 0; s.collisionCount = 0; });
+
+  // Pair lines group (insert behind singers so lines sit under the ovals)
+  const pairLineGroup = el('g', {id: 'pair-lines'});
+  if(stageG.firstChild) stageG.insertBefore(pairLineGroup, stageG.firstChild); else stageG.appendChild(pairLineGroup);
 
   // Movement loop
   let startTime = null; let movementActive = false; let lastTs = null; let stopRequested=false;
@@ -222,96 +525,232 @@
   function step(ts){
     if(!startTime) startTime = ts;
     const elapsed = ts - startTime;
+    updateTimer(elapsed);
 
     // Activate movement at correct time, but avoid a big dt jump by resetting lastTs when activation happens
-    if(!movementActive && elapsed >= movementStart){ movementActive = true; justActivated = true; lastTs = ts; }
+    if(!movementActive && elapsed >= movementStart){ movementActive = true; justActivated = true; lastTs = ts; setStageLabel('stage1'); }
     const dt = lastTs ? (ts - lastTs)/1000 : 0; // seconds
 
-    for(const s of mobileSingers){
-      if(!movementActive){ applyTransform(s); continue; }
+    // --- Stage timeline triggers (ordered chronologically) ---
+    // Stage 1 (1s+): свободное блуждание, в 15s подбор партнёров (набросок)
+    if(movementActive && !pairSelected && elapsed >= PAIR_SELECT_AT){ startPairSelection(); }
 
-      // decrement timer and possibly pick new target
-      s.timeToNextTarget -= dt*1000;
+    // Stage 2 (20s): формирование пар и парная ходьба
+    if(movementActive && !pairSplit && elapsed >= PAIR_SPLIT_AT){ setStageLabel('stage2'); startPairSplit(); }
+
+    // Stage 3 (35s): остановка и разворот к зрителю
+    if(pairWalking && elapsed >= PAIR_WALK_END){ setStageLabel('stage3'); startPairFacing(); }
+
+    // Stage 4 (45s): возврат в колонны
+    if(pairFaced && !returnStarted && elapsed >= PAIR_FACE_END){ setStageLabel('stage4'); startReturnToFormation(); }
+
+    // Stage 5 (55s): формирование буквы X
+    if(!stage5Started && elapsed >= STAGE5_START){ setStageLabel('stage5'); startStage5(); }
+
+    // --- Per-singer behavior (Stage 1 wander, Stage 2 walk in pairs, Stage 3 face audience, Stage 4 return, Stage 5 X) ---
+    const actorList = stage5Started ? singers : mobileSingers;
+    for(const s of actorList){
+      if(!movementActive){ applyTransform(s); continue; }
+      if(stage5Started){
+        applyStage5Motion(s, dt, elapsed);
+        continue;
+      }
+      if(s.hasFinishedReturn){
+        // gently keep at home position
+        s.vx = 0; s.vy = 0; s.timeToNextTarget = 1e9; s.target = {x:s.homeX, y:s.homeY};
+        const dxHome = s.homeX - s.cx, dyHome = s.homeY - s.cy;
+        if(Math.hypot(dxHome, dyHome) > 0.5){ s.cx += dxHome * 0.35; s.cy += dyHome * 0.35; }
+        applyTransform(s); continue;
+      }
+      const isReturning = s.isReturning;
+      let pairClose = false, partnerForAvoid = null, pairNearThresh = null;
+
+      // Stage 2 — парная ходьба (если у участника есть партнёр)
+      if(pairWalking && s.partnerId != null){
+        // find pair object
+        const p = getPairForSinger(s);
+        if(p){
+          const partner = (p.a===s) ? p.b : p.a;
+          // update pair center path occasionally
+          p.centerNextAt -= dt*1000;
+          if(p.centerNextAt <= 0){ p.centerTarget = pickWideCenterTarget(s); p.centerNextAt = 1200 + Math.random()*3000; }
+
+          // compute desired center position
+          const cx = p.centerTarget.x, cy = p.centerTarget.y;
+          // compute near-touching separation so they almost touch
+          const separation = Math.max(2, (p.a.rxx + p.b.rxx) - 2); // small gap of ~2px
+          const halfSep = separation/2;
+          const distP = dist(s, partner);
+          const nearThresh = (p.a.rxx + p.b.rxx) * 1.2;
+          pairClose = distP <= nearThresh; partnerForAvoid = partner; pairNearThresh = nearThresh;
+          // force face-to-face until сблизились
+          if(!pairClose && p.mode !== 'face'){ p.mode = 'face'; }
+          // once together, alternate между face/side
+          if(pairClose && elapsed >= p.modeSwitchAt){
+            p.mode = (p.mode === 'side') ? 'face' : 'side';
+            p.modeSwitchAt = elapsed + 2500 + Math.random()*2000;
+          } else if(!pairClose && p.modeSwitchAt < elapsed + 2000){
+            p.modeSwitchAt = elapsed + 2000; // delay switching until meeting
+          }
+          if(p.mode === 'side'){
+            // lateral offset perpendicular to heading from current to center
+            const heading = Math.atan2(cy - s.cy, cx - s.cx);
+            const offsetDir = (p.a===s) ? -1 : 1;
+            const perpX = Math.cos(heading + Math.PI/2) * offsetDir * halfSep;
+            const perpY = Math.sin(heading + Math.PI/2) * offsetDir * halfSep;
+            s.target = { x: cx + perpX, y: cy + perpY };
+          } else {
+            // face-to-face: approach center to near-touch positions
+            const ownSign = (p.a===s) ? -1 : 1;
+            const dirX = cx - s.cx, dirY = cy - s.cy; const ddir = Math.hypot(dirX, dirY) || 1;
+            const nx = dirX/ddir, ny = dirY/ddir;
+            s.target = { x: cx + nx * ownSign * halfSep, y: cy + ny * ownSign * halfSep };
+          }
+          // update decorative line immediately
+          if(p.line){ p.line.setAttribute('x1', p.a.cx); p.line.setAttribute('y1', p.a.cy); p.line.setAttribute('x2', p.b.cx); p.line.setAttribute('y2', p.b.cy); }
+        }
+      }
+
+      // Stage 3 — разворот к зрителю (пара зафиксирована)
+      if(pairFaced && !returnStarted){
+        // stop motion and rotate to pair-facing angle (pair-level offset)
+        s.vx = 0; s.vy = 0; s.timeToNextTarget = 1e9; s.target = null;
+        // determine pair facing angle
+        const p = getPairForSinger(s);
+        const desiredAngle = p && typeof p.facingAngle === 'number' ? p.facingAngle : 0;
+        const maxTurn = 180 * dt;
+        const delta = angleDiff(s.angle, desiredAngle);
+        const capped = Math.max(-maxTurn, Math.min(maxTurn, delta));
+        s.angle = s.angle + capped;
+        applyTransform(s);
+        // update pair line while faced
+        if(p && p.line){ p.line.setAttribute('x1', p.a.cx); p.line.setAttribute('y1', p.a.cy); p.line.setAttribute('x2', p.b.cx); p.line.setAttribute('y2', p.b.cy); }
+        continue; // skip regular movement integration
+      }
+
+      // Stage 1 / Stage 4 — блуждание или возврат (пропускаем если Stage 5 активна)
+      const convergePhase = movementActive && (elapsed <= movementStart + convergeDuration);
+      if(!stage5Started){
+        if(isReturning){
+          s.timeToNextTarget = 1e9;
+          if(!s.target){ // fallback target if missing
+            const slot = chooseReturnSlotOnce(s);
+            s.target = slot ? {x: slot.x, y: slot.y} : {x: s.homeX, y: s.homeY};
+          }
+          // speed adjustment to guarantee arrival within 10s of return start
+          const tElapsed = returnStartMs ? Math.max(0, (performance.now() - returnStartMs)) : 0;
+          const remainingMs = Math.max(500, 10000 - tElapsed);
+          const remainingSec = remainingMs/1000;
+          const d = Math.hypot(s.cx - s.target.x, s.cy - s.target.y);
+          const reqSpeed = d / remainingSec;
+          if(reqSpeed > s.speed) s.speed = reqSpeed * 1.05;
+        } else if(convergePhase){
+          s.timeToNextTarget = Math.min(s.timeToNextTarget, 800);
+          const target = pickCenterPullTarget(s);
+          const center = {x: vbox.w/2, y: vbox.h/2};
+          const curDist = Math.hypot(s.cx - center.x, s.cy - center.y);
+          const tgtDist = Math.hypot(target.x - center.x, target.y - center.y);
+          if(!s.target || tgtDist < curDist) s.target = target;
+        } else {
+          s.timeToNextTarget -= dt*1000;
+          if(!s.target) s.target = pickRandomTarget(s);
+        }
+      }
       const toTarget = {x: s.target.x - s.cx, y: s.target.y - s.cy};
       const distToTarget = Math.sqrt(toTarget.x*toTarget.x + toTarget.y*toTarget.y);
-      if(distToTarget < 10 || s.timeToNextTarget <= 0){ s.target = pickRandomTarget(s); s.timeToNextTarget = 1800 + Math.random()*4000; }
+      if(isReturning && distToTarget < 6){
+        // gently settle into home slot without teleport
+        s.isReturning = false; s.hasFinishedReturn = true;
+        s.timeToNextTarget = 1e9;
+        s.target = {x: s.homeX, y: s.homeY};
+        s.vx = 0; s.vy = 0;
+        s.angle = 0; // face strictly forward
+        const slot = typeof s.returnSlotId === 'number' ? [...returnSlotsLeft, ...returnSlotsRight].find(sl=>sl.id===s.returnSlotId) : null;
+        if(slot && slot.takenBy !== s.id) slot.takenBy = s.id;
+        applyTransform(s);
+        continue;
+      }
+      if(!isReturning && !convergePhase && (distToTarget < 10 || s.timeToNextTarget <= 0)){ s.target = pickRandomTarget(s); s.timeToNextTarget = 1800 + Math.random()*4000; }
 
       // Desired velocity (seek) — target direction normalized * speed
       let desiredVX = 0, desiredVY = 0;
       if(distToTarget > 1){ desiredVX = (toTarget.x/distToTarget) * s.speed; desiredVY = (toTarget.y/distToTarget) * s.speed; }
 
-  // Separation and dodge adjustments (softer to avoid oscillations)
-  const sep = computeSeparation(s);
-  const dodge = computeObstacleDodge(s);
-  const avoidWeightX = sep.x * 28 + dodge.x; // softer separation
-  const avoidWeightY = sep.y * 28 + dodge.y;
-  const combinedVX = desiredVX + avoidWeightX;
-  const combinedVY = desiredVY + avoidWeightY;
+      // Separation and dodge adjustments (softer to avoid oscillations)
+      let combinedVX = desiredVX;
+      let combinedVY = desiredVY;
+      if(!returnStarted){
+      const sep = computeSeparation(s);
+      const dodge = computeObstacleDodge(s);
+      const relaxAvoid = (pairWalking && s.partnerId && !pairClose) ? 0.5 : 1;
+      combinedVX += sep.x * 28 * relaxAvoid + dodge.x * relaxAvoid;
+      combinedVY += sep.y * 28 * relaxAvoid + dodge.y * relaxAvoid;
+      }
 
-  // steering factor (higher = faster alignment, but keep moderate for smooth turns)
-  const steeringAlpha = 0.14; // responsive yet smooth
-  s.vx += (combinedVX - s.vx) * steeringAlpha;
-  s.vy += (combinedVY - s.vy) * steeringAlpha;
+      // steering factor (higher = faster alignment, but keep moderate for smooth turns)
+      const steeringAlpha = 0.14; // responsive yet smooth
+      s.vx += (combinedVX - s.vx) * steeringAlpha;
+      s.vy += (combinedVY - s.vy) * steeringAlpha;
 
       // Predict next position and check for potential collisions; if collision predicted, negotiate who yields
       const nextX = s.cx + s.vx * dt;
       const nextY = s.cy + s.vy * dt;
       let collided = false;
-      let collisionCorrection = {x:0,y:0};
-      for(const other of singers){ if(other===s) continue;
-        const minD = other.rxx + s.rxx + 2;
-        const ddx = nextX - other.cx, ddy = nextY - other.cy; const dd = Math.sqrt(ddx*ddx + ddy*ddy);
-        if(dd < minD){
-          collided = true;
-          // negotiate: the singer farther from its current target yields (will sidestep)
-          const otherDistToTarget = other.target ? Math.hypot(other.target.x - other.cx, other.target.y - other.cy) : 0;
-          const myDistToTarget = s.target ? Math.hypot(s.target.x - s.cx, s.target.y - s.cy) : 0;
-          if(myDistToTarget > otherDistToTarget){
-            // s yields: create a lateral temporary target away from other
+      if(!returnStarted){
+        let collisionCorrection = {x:0,y:0};
+        for(const other of singers){ if(other===s) continue;
+          let minD = other.rxx + s.rxx + 2;
+          if(pairWalking && s.partnerId && !pairClose){ minD = Math.min(minD, H); } // allow closer approach during reunion
+          const ddx = nextX - other.cx, ddy = nextY - other.cy; const dd = Math.sqrt(ddx*ddx + ddy*ddy);
+          if(dd < minD){
+            collided = true;
             const nx = (dd>0) ? (ddx/dd) : (Math.random()-0.5);
             const ny = (dd>0) ? (ddy/dd) : (Math.random()-0.5);
             const px = -ny, py = nx; // perpendicular
-            s.target = { x: s.cx + px * (minD + 30), y: s.cy + py * (minD + 30) };
-            collisionCorrection.x += px * (minD - dd) * 0.6;
-            collisionCorrection.y += py * (minD - dd) * 0.6;
-          } else {
-            // other yields: nudge away
-            const nx = (dd>0) ? (ddx/dd) : (Math.random()-0.5);
-            const ny = (dd>0) ? (ddy/dd) : (Math.random()-0.5);
-            const px = -ny, py = nx;
-            collisionCorrection.x += px * (minD - dd) * 0.4;
-            collisionCorrection.y += py * (minD - dd) * 0.4;
+            const weight = 0.5;
+            collisionCorrection.x += px * (minD - dd) * weight;
+            collisionCorrection.y += py * (minD - dd) * weight;
           }
         }
-      }
 
-      if(collided){
-        // apply small correction and retarget to break potential oscillation
-        s.vx += collisionCorrection.x * 2;
-        s.vy += collisionCorrection.y * 2;
-        s.collisionCount = (s.collisionCount || 0) + 1;
-        if(s.collisionCount > 3){ s.target = pickRandomTarget(s); s.collisionCount = 0; }
+        if(collided){
+          s.vx += collisionCorrection.x * 2;
+          s.vy += collisionCorrection.y * 2;
+          s.collisionCount = (s.collisionCount || 0) + 1;
+          if(s.collisionCount > 3){ s.target = pickRandomTarget(s); s.collisionCount = 0; }
+        } else { s.collisionCount = 0; }
       } else {
         s.collisionCount = 0;
       }
 
-  // Damping to avoid perpetual circulation
-  const damping = Math.max(0, 1 - 2.0*dt);
-  s.vx *= damping; s.vy *= damping;
+      // Damping to avoid perpetual circulation; lighter damping while converging to keep pull effective
+      const damping = Math.max(0, 1 - (convergePhase ? 1.0 : 2.0)*dt);
+      s.vx *= damping; s.vy *= damping;
 
-    // Limit speed
-    let spd = Math.sqrt(s.vx*s.vx + s.vy*s.vy);
-    const maxSpeed = s.speed * 1.4;
-    if(spd > maxSpeed){ s.vx = s.vx/spd*maxSpeed; s.vy = s.vy/spd*maxSpeed; spd = maxSpeed; }
+      // Limit speed
+      let spd = Math.sqrt(s.vx*s.vx + s.vy*s.vy);
+      const maxSpeed = s.speed * 1.4;
+      if(spd > maxSpeed){ s.vx = s.vx/spd*maxSpeed; s.vy = s.vy/spd*maxSpeed; spd = maxSpeed; }
 
-    // Integrate (clamp to stage bounds only to avoid instant jumps into inner area)
-    s.cx += s.vx * dt; s.cy += s.vy * dt;
-    s.cx = Math.max(stageLeftLimit, Math.min(stageRightLimit, s.cx));
-    s.cy = Math.max(innerTopLimit, Math.min(innerBottomLimit, s.cy));
+      // Integrate (clamp to stage bounds only to avoid instant jumps into inner area)
+      s.cx += s.vx * dt; s.cy += s.vy * dt;
+      s.cx = Math.max(stageLeftLimit, Math.min(stageRightLimit, s.cx));
+      s.cy = Math.max(innerTopLimit, Math.min(innerBottomLimit, s.cy));
 
-      // Compute angle from velocity; arrow is drawn up so add 90 degrees
+      // Compute angle: during pair walk, if not yet рядом или mode face, поворачиваться лицом к партнёру
       if(spd > 0.3){
         let desired = Math.atan2(s.vy, s.vx) * 180 / Math.PI + 90;
+        if(pairWalking && s.partnerId != null){
+          const p = getPairForSinger(s);
+          if(p){
+            const partner = (p.a===s) ? p.b : p.a;
+            const distP = dist(s, partner);
+            const nearThresh = (p.a.rxx + p.b.rxx) * 1.2;
+            if(p.mode === 'face' || distP > nearThresh){
+              desired = Math.atan2(partner.cy - s.cy, partner.cx - s.cx) * 180 / Math.PI + 90;
+            }
+          }
+        }
         const maxTurn = 90 * dt; // smaller max turn for smooth small-degree rotations
         const delta = angleDiff(s.angle, desired);
         const capped = Math.max(-maxTurn, Math.min(maxTurn, delta));
@@ -321,30 +760,40 @@
       applyTransform(s);
     }
 
-    // Post-pass: hard separation to resolve any remaining overlaps (split overlap evenly)
-    for(let i=0;i<singers.length;i++){
-      for(let j=i+1;j<singers.length;j++){
-        const a = singers[i], b = singers[j];
-        const md = a.rxx + b.rxx + 2;
-        const dx = a.cx - b.cx, dy = a.cy - b.cy; const d = Math.sqrt(dx*dx + dy*dy)||0.001;
-        if(d < md){
-          const overlap = (md - d);
-          const nx = dx/d, ny = dy/d;
-          const adjustX = nx * overlap * 0.5;
-          const adjustY = ny * overlap * 0.5;
-          // move mobiles preferentially; if both static, move none
-          if(a.movable) { a.cx += adjustX; a.cy += adjustY; }
-          if(b.movable) { b.cx -= adjustX; b.cy -= adjustY; }
-          // ensure within stage
-          a.cx = Math.max(stageLeftLimit, Math.min(stageRightLimit, a.cx)); a.cy = Math.max(innerTopLimit, Math.min(innerBottomLimit, a.cy));
-          b.cx = Math.max(stageLeftLimit, Math.min(stageRightLimit, b.cx)); b.cy = Math.max(innerTopLimit, Math.min(innerBottomLimit, b.cy));
-          applyTransform(a); applyTransform(b);
+    if(!returnStarted && !stage5Started){
+      // Post-pass: hard separation to resolve any remaining overlaps (split overlap evenly)
+      for(let i=0;i<singers.length;i++){
+        for(let j=i+1;j<singers.length;j++){
+          const a = singers[i], b = singers[j];
+          let md = a.rxx + b.rxx + 2;
+          if(pairWalking){ md = Math.min(md, H); }
+          const dx = a.cx - b.cx, dy = a.cy - b.cy; const d = Math.sqrt(dx*dx + dy*dy)||0.001;
+          if(d < md){
+            const overlap = (md - d);
+            const nx = dx/d, ny = dy/d;
+            const adjustX = nx * overlap * 0.5;
+            const adjustY = ny * overlap * 0.5;
+            if(a.movable) { a.cx += adjustX; a.cy += adjustY; }
+            if(b.movable) { b.cx -= adjustX; b.cy -= adjustY; }
+            a.cx = Math.max(stageLeftLimit, Math.min(stageRightLimit, a.cx)); a.cy = Math.max(innerTopLimit, Math.min(innerBottomLimit, a.cy));
+            b.cx = Math.max(stageLeftLimit, Math.min(stageRightLimit, b.cx)); b.cy = Math.max(innerTopLimit, Math.min(innerBottomLimit, b.cy));
+            applyTransform(a); applyTransform(b);
+          }
         }
       }
     }
 
     // avoid initial teleport: after activation skip applying movement until next frame
     if(justActivated){ justActivated = false; }
+
+    // show/hide pair lines depending on pair state and update their endpoints
+    pairs.forEach(p=>{
+      const visible = (pairSplit && (pairWalking || (pairFaced && !returnStarted)));
+      if(p.line){
+        p.line.style.display = visible ? '' : 'none';
+        if(visible){ p.line.setAttribute('x1', p.a.cx); p.line.setAttribute('y1', p.a.cy); p.line.setAttribute('x2', p.b.cx); p.line.setAttribute('y2', p.b.cy); }
+      }
+    });
 
     lastTs = ts;
     if(!stopRequested) requestAnimationFrame(step);
@@ -363,3 +812,5 @@
 })();
 ]]></script>
 </svg>
+  let returnSlotsLeft = [], returnSlotsRight = [];
+  let returnStartMs = null;
