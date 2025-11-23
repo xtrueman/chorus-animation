@@ -452,16 +452,16 @@
     // male semicircle params (hyperbola, edges further from viewer)
     const centerX = vbox.w/2;
     const baseY = vbox.h*0.82; // ближе к заднему краю
-    const spanX = vbox.w*0.56; // ещё шире дуга, но остаётся в сцене
-    const depth = vbox.h*0.36; // ещё сильнее вогнута
+    const spanX = vbox.w*0.6; // шире дуга, остаётся в сцене (ограничим клампами)
+    const depth = vbox.h*0.4; // ещё сильнее вогнута
     const males = singers.filter(s=>s.role==='tenor' || s.role==='baritone');
     const maleCount = males.length;
     const maleSlots = [];
     for(let idx=0; idx<maleCount; idx++){
       const t = maleCount>1 ? (idx/(maleCount-1)) : 0.5; // 0..1
-      const x = Math.max(20+rx, Math.min(vbox.w-20-rx, centerX + (t-0.5)*spanX*2));
+      const x = Math.max(40+rx, Math.min(vbox.w-40-rx, centerX + (t-0.5)*spanX*2));
       const curve = (t-0.5);
-      const y = baseY + depth * (0.5 - curve*curve*2.8); // ещё глубже, вогнута к зрителю
+      const y = Math.max(60+ry, Math.min(vbox.h-60-ry, baseY + depth * (0.55 - curve*curve*3.4))); // глубже, вогнута к зрителю и в сцене
       maleSlots.push({x,y,taken:false});
     }
     // assign nearest available slot to each male based on current position
@@ -558,12 +558,12 @@
       const remainSec = remainMs/1000;
       const reqSpeed = dist / remainSec;
       // значительно ускоряем выход в дугу, чтобы занять места гораздо быстрее
-      const boost = 3.0;
-      s.speed = Math.max(s.speed*0.85, reqSpeed * boost);
+      const boost = 6.0;
+      s.speed = Math.max(s.speed*0.8, reqSpeed * boost);
       const desiredVX = dist>0.1 ? (dx/dist)*s.speed : 0;
       const desiredVY = dist>0.1 ? (dy/dist)*s.speed : 0;
-      s.vx += (desiredVX - s.vx)*0.22;
-      s.vy += (desiredVY - s.vy)*0.22;
+      s.vx += (desiredVX - s.vx)*0.3;
+      s.vy += (desiredVY - s.vy)*0.3;
       s.cx += s.vx*dt;
       s.cy += s.vy*dt;
       s.angle = 0;
