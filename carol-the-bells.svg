@@ -193,9 +193,6 @@
   const soloX = vbox.w/2;
   const soloY = vbox.h/2;
   const solo = createSinger(idCounter++, 'soloist', false, soloX, soloY, {});
-  const soloLabel = el('text', {x: soloX, y: soloY + 60, 'class':'role-label'});
-  soloLabel.textContent = 'Солист';
-  stageG.appendChild(soloLabel);
 
   // Apply initial transform (must be pixel-identical to initial layout)
   function applyTransform(s){ s.dom.g.setAttribute('transform', `translate(${s.cx},${s.cy}) rotate(${s.angle})`); }
@@ -812,5 +809,3 @@
 })();
 ]]></script>
 </svg>
-  let returnSlotsLeft = [], returnSlotsRight = [];
-  let returnStartMs = null;
