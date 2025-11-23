@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- carol-the-bells.svg — procedural choir choreography, Stage 1 implemented -->
-<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900" xmlns:xlink="http://www.w3.org/1999/xlink">
+<svg xmlns="http://www.w3.org/2000/svg" width="100%" height="100%" viewBox="0 0 1600 900" xmlns:xlink="http://www.w3.org/1999/xlink">
   <defs>
     <style><![CDATA[
       text { font-family: Arial, Helvetica, sans-serif; fill: #eee }
@@ -71,7 +71,8 @@
     stage2: 'Stage 2 — Формирование пар и парная ходьба',
     stage3: 'Stage 3 — Остановка и разворот к зрителю',
     stage4: 'Stage 4 — Возврат в колонны',
-    stage5: 'Stage 5 — Формирование буквы X'
+    stage5: 'Stage 5 — Формирование буквы X',
+    stage6: 'Stage 6 — двойной хоровод и полукруг'
   };
 
   // Timeline for pairing/returning (relative to startTime)
@@ -84,6 +85,8 @@
   const RETURN_END = PAIR_FACE_END + RETURN_DURATION; // 55s
   const STAGE5_START = RETURN_END; // 55s
   const STAGE5_END = STAGE5_START + 16000; // 16s duration
+  const STAGE6_START = STAGE5_END; // 71s
+  const STAGE6_END = STAGE6_START + 20000; // 20s
 
   // Speed multiplier for walking actors (user requested 1.5x)
   const WALK_SPEED_MULT = 1.5;
@@ -111,6 +114,7 @@
   let returnSlotsLeft = [], returnSlotsRight = [];
   let returnStartMs = null, stage5StartMs = null;
   let stage5SpeedPhase1 = 0, stage5SpeedPhase2 = 0;
+  let stage6Started = false;
 
   // Helper: create an SVG element
   function el(tag, attrs){
@@ -226,9 +230,10 @@
   function pickWideCenterTarget(refSinger){
     const cx = vbox.w/2, cy = vbox.h/2;
     let best = pickRandomTarget(refSinger), bestScore = -1;
-    for(let i=0;i<16;i++){
+    for(let i=0;i<24;i++){
       const t = pickRandomTarget(refSinger);
-      const score = Math.hypot(t.x - cx, t.y - cy) + Math.random()*40; // bias outward, add jitter to avoid ties
+      // сильнее тянем на периферию, чтобы пары не кучковались в центре
+      const score = Math.hypot(t.x - cx, t.y - cy) * 1.2 + Math.random()*60;
       if(score > bestScore){ bestScore = score; best = t; }
     }
     return best;
@@ -439,6 +444,78 @@
     if(!isFinite(stage5SpeedPhase2)) stage5SpeedPhase2 = 0;
   }
 
+  function startStage6(){
+    stage6Started = true;
+    stage5Started = false;
+    // reset velocities so stage 5 motion doesn't linger
+    singers.forEach(s=>{ s.vx = 0; s.vy = 0; s.timeToNextTarget = 1e9; });
+    // male semicircle params (hyperbola, edges further from viewer)
+    const centerX = vbox.w/2;
+    const baseY = vbox.h*0.82; // ближе к заднему краю
+    const spanX = vbox.w*0.56; // ещё шире дуга, но остаётся в сцене
+    const depth = vbox.h*0.36; // ещё сильнее вогнута
+    const males = singers.filter(s=>s.role==='tenor' || s.role==='baritone');
+    const maleCount = males.length;
+    const maleSlots = [];
+    for(let idx=0; idx<maleCount; idx++){
+      const t = maleCount>1 ? (idx/(maleCount-1)) : 0.5; // 0..1
+      const x = Math.max(20+rx, Math.min(vbox.w-20-rx, centerX + (t-0.5)*spanX*2));
+      const curve = (t-0.5);
+      const y = baseY + depth * (0.5 - curve*curve*2.8); // ещё глубже, вогнута к зрителю
+      maleSlots.push({x,y,taken:false});
+    }
+    // assign nearest available slot to each male based on current position
+    males.forEach(m=>{
+      let bestIdx = -1, bestD = 1e9;
+      for(let i=0;i<maleSlots.length;i++){
+        if(maleSlots[i].taken) continue;
+        const d = Math.hypot(maleSlots[i].x - m.cx, maleSlots[i].y - m.cy);
+        if(d < bestD){ bestD = d; bestIdx = i; }
+      }
+      const slot = bestIdx>=0 ? maleSlots[bestIdx] : maleSlots.find(s=>!s.taken);
+      if(slot){
+        slot.taken = true;
+        m.stage6Target = {x: slot.x, y: slot.y};
+        m.angle = 0;
+        m.timeToNextTarget = 1e9;
+      }
+    });
+
+    // female double ring params
+    const females = singers.filter(s=>s.role==='soprano' || s.role==='alto');
+    const innerCount = Math.ceil(females.length / 3); // в 2 раза меньше, чем внешний
+    const outerCount = females.length - innerCount;
+    const inner = females.slice(0, innerCount);
+    const outer = females.slice(innerCount);
+    const ringCenterX = vbox.w/2;
+    const ringCenterY = vbox.h*0.5;
+    const baseR = vbox.w*0.14; // уменьшены радиусы, чтобы не пересекаться с мужской дугой
+    const innerR = baseR*0.72;
+    const outerR = baseR*1.18;
+    const assignRing = (list, radius, clockwise)=>{
+      const angStep = (Math.PI*2)/list.length;
+      list.forEach((f, idx)=>{
+        const angle = idx*angStep;
+        f.stage6Angle = angle;
+        f.stage6Radius = radius;
+        f.stage6Clockwise = clockwise;
+        f.stage6Center = {x:ringCenterX, y:ringCenterY};
+        f.stage6Target = {x: ringCenterX + Math.cos(angle)*radius, y: ringCenterY + Math.sin(angle)*radius};
+        f.timeToNextTarget = 1e9;
+      });
+    };
+    assignRing(inner, innerR, true);
+    assignRing(outer, outerR, false);
+    // solist возвращаем в центр
+    const sol = singers.find(s=>s.role==='soloist');
+    if(sol){
+      sol.stage6Target = {x: vbox.w/2, y: vbox.h/2};
+      sol.stage6Center = {x: vbox.w/2, y: vbox.h/2};
+      sol.stage6Angle = 0;
+      sol.stage6Radius = 0;
+    }
+  }
+
   function applyStage5Motion(s, dt, elapsed){
     if(!s.stage5Target || !s.stage5Phase1Target) return;
     const phaseEnd1 = (STAGE5_START + 1000);
@@ -468,6 +545,59 @@
     s.cy += s.vy * dt;
     s.angle = 0; // face forward
     applyTransform(s);
+  }
+
+  function applyStage6Motion(s, dt, elapsed){
+    if(!s.stage6Target && !s.stage6Radius) return;
+    if(s.role==='tenor' || s.role==='baritone'){
+      // move to semicircle target, keep facing forward
+      const tgt = s.stage6Target;
+      const dx = tgt.x - s.cx, dy = tgt.y - s.cy;
+      const dist = Math.hypot(dx, dy);
+      const remainMs = Math.max(300, STAGE6_END - elapsed);
+      const remainSec = remainMs/1000;
+      const reqSpeed = dist / remainSec;
+      // значительно ускоряем выход в дугу, чтобы занять места гораздо быстрее
+      const boost = 3.0;
+      s.speed = Math.max(s.speed*0.85, reqSpeed * boost);
+      const desiredVX = dist>0.1 ? (dx/dist)*s.speed : 0;
+      const desiredVY = dist>0.1 ? (dy/dist)*s.speed : 0;
+      s.vx += (desiredVX - s.vx)*0.22;
+      s.vy += (desiredVY - s.vy)*0.22;
+      s.cx += s.vx*dt;
+      s.cy += s.vy*dt;
+      s.angle = 0;
+      applyTransform(s);
+    } else if(s.role==='soprano' || s.role==='alto'){
+      // rotate on ring
+      const angVel = (s.stage6Clockwise ? 1 : -1) * (Math.PI*2 / (STAGE6_END - STAGE6_START)); // нормальный темп
+      s.stage6Angle += angVel * dt * 1000;
+      const cx = s.stage6Center.x, cy = s.stage6Center.y;
+      const r = s.stage6Radius;
+      s.cx = cx + Math.cos(s.stage6Angle)*r;
+      s.cy = cy + Math.sin(s.stage6Angle)*r;
+      // поворот по касательной (лицом по направлению движения)
+      const dirAngle = Math.atan2(angVel>=0 ? 1 : -1, 0); // sign only
+      s.angle = (s.stage6Clockwise ? (Math.atan2(Math.sin(s.stage6Angle), Math.cos(s.stage6Angle)) * 180/Math.PI + 90) : (Math.atan2(Math.sin(s.stage6Angle), Math.cos(s.stage6Angle)) * 180/Math.PI - 90));
+      applyTransform(s);
+    } else if(s.role==='soloist'){
+      // move back to center
+      const tgt = s.stage6Target || {x:s.homeX, y:s.homeY};
+      const dx = tgt.x - s.cx, dy = tgt.y - s.cy;
+      const dist = Math.hypot(dx, dy);
+      const remainMs = Math.max(300, STAGE6_END - elapsed);
+      const remainSec = remainMs/1000;
+      const reqSpeed = dist / remainSec;
+      s.speed = Math.max(s.speed*0.9, reqSpeed);
+      const desiredVX = dist>0.1 ? (dx/dist)*s.speed : 0;
+      const desiredVY = dist>0.1 ? (dy/dist)*s.speed : 0;
+      s.vx += (desiredVX - s.vx)*0.12;
+      s.vy += (desiredVY - s.vy)*0.12;
+      s.cx += s.vx*dt;
+      s.cy += s.vy*dt;
+      s.angle = 0;
+      applyTransform(s);
+    }
   }
 
   // Compute separation (repulsion) vector from others
@@ -544,10 +674,17 @@
     // Stage 5 (55s): формирование буквы X
     if(!stage5Started && elapsed >= STAGE5_START){ setStageLabel('stage5'); startStage5(); }
 
+    // Stage 6 (71s): двойной хоровод и полукруг
+    if(!stage6Started && elapsed >= STAGE6_START){ setStageLabel('stage6'); stage5Started = false; startStage6(); }
+
     // --- Per-singer behavior (Stage 1 wander, Stage 2 walk in pairs, Stage 3 face audience, Stage 4 return, Stage 5 X) ---
-    const actorList = stage5Started ? singers : mobileSingers;
+    const actorList = (stage6Started || stage5Started) ? singers : mobileSingers;
     for(const s of actorList){
       if(!movementActive){ applyTransform(s); continue; }
+      if(stage6Started){
+        applyStage6Motion(s, dt, elapsed);
+        continue;
+      }
       if(stage5Started){
         applyStage5Motion(s, dt, elapsed);
         continue;
@@ -677,11 +814,13 @@
       let combinedVX = desiredVX;
       let combinedVY = desiredVY;
       if(!returnStarted){
-      const sep = computeSeparation(s);
-      const dodge = computeObstacleDodge(s);
-      const relaxAvoid = (pairWalking && s.partnerId && !pairClose) ? 0.5 : 1;
-      combinedVX += sep.x * 28 * relaxAvoid + dodge.x * relaxAvoid;
-      combinedVY += sep.y * 28 * relaxAvoid + dodge.y * relaxAvoid;
+        const sep = computeSeparation(s);
+        const dodge = computeObstacleDodge(s);
+        const relaxAvoid = (pairWalking && s.partnerId && !pairClose) ? 0.4 : 1;
+        combinedVX += sep.x * 30 * relaxAvoid + dodge.x * relaxAvoid;
+        combinedVY += sep.y * 30 * relaxAvoid + dodge.y * relaxAvoid;
+        // немного ускоряем сближение пар
+        if(pairWalking && s.partnerId){ combinedVX *= 1.08; combinedVY *= 1.08; }
       }
 
       // steering factor (higher = faster alignment, but keep moderate for smooth turns)
